@@ -1,0 +1,56 @@
+# The aarch64 AppImage of this branch (docs/linux.md, "AppImages"; docs/mali.md), built as tools/linux/appimage.sh
+# builds it: in Ubuntu 22.04 containers with podman, cross-compiled from amd64, the arm64 generator helper frozen
+# under QEMU. Each push to mali-fixes (and a manual run) replaces the "mali-latest" pre-release's AppImage; the
+# workflow run also keeps it as an artifact. No game files are involved: the start screen builds the game on the
+# player's machine.
+name: AppImage (aarch64)
+
+on:
+  push:
+    branches: [mali-fixes]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: appimage-aarch64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: QEMU for the arm64 container
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Podman
+        run: |
+          command -v podman || { sudo apt-get update && sudo apt-get install -y podman; }
+          podman --version
+
+      - name: Build the AppImage
+        run: make appimage ARCH=aarch64
+
+      - name: Keep it as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Savage_Wind-aarch64-AppImage
+          path: build/dist/*.AppImage
+          if-no-files-found: error
+
+      - name: Publish it as the mali-latest pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f=$(ls build/dist/*-aarch64.AppImage | head -1)
+          notes="aarch64 AppImage of the mali-fixes branch at ${GITHUB_SHA::7}, built by GitHub Actions. Tested hardware and settings: docs/mali.md. Upstream (Revivedx/SavageWindRecomp) has these Mali fixes and newer work."
+          gh release delete mali-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create mali-latest "$f" --prerelease --target "$GITHUB_SHA" \
+              --title "Mali build (aarch64, ${GITHUB_SHA::7})" --notes "$notes"

@@ -7,6 +7,11 @@
 > trust code written by AI, you can simply ignore this project. As with anything on the internet, you run the code at
 > your own discretion.
 
+> [!NOTE]
+> **This fork: Mali-G610 (RK3588) on aarch64 Linux.** The `mali-fixes` branch is the Mali work merged upstream as
+> PR #212; upstream's `main` and `test` already include it and newer changes, so build those unless you need this
+> branch. Tested on a Retro Lite CM5 with Arm's Mali driver; PanVK is untested. Details: [docs/mali.md](docs/mali.md).
+
 **Savage Wind Recomp** is a work-in-progress static recompilation of *The Legend of Zelda: Breath of the Wild*
 (Nintendo Switch, version 1.9.0) into a native application for Windows and Linux. The goal is a full PC
 version of your own copy of the game: a launcher, PC-style graphics options, mods, any controller, keyboard and

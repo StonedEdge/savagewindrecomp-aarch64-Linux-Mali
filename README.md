@@ -1,5 +1,10 @@
 # Savage Wind Recomp
 
+> [!NOTE]
+> **This fork's Mali work is on the [`mali-fixes`](../../tree/mali-fixes) branch** (Mali-G610 / RK3588 on aarch64
+> Linux; see its `docs/mali.md`). This `main` is an old copy of upstream. The Mali fixes were merged upstream as
+> PR #212, so for a current build use [Revivedx/SavageWindRecomp](https://github.com/Revivedx/SavageWindRecomp).
+
 > [!IMPORTANT]
 > **This project is made almost entirely with AI.** Nearly all of the code, tooling, reverse engineering and
 > documentation here is written by an AI (Anthropic's Claude, through Claude Code), directed, tested and reviewed by

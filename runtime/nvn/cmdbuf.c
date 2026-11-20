@@ -3,6 +3,9 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 #include "nvn.h"
 
@@ -53,6 +56,81 @@ static int g_ngrave, g_capgrave;
 static pthread_mutex_t g_shadow_lock = PTHREAD_MUTEX_INITIALIZER;
 uint64_t renderer_present_count(void);
 
+// Record blocks come from an allocator of their own, not malloc. The game keeps tens of thousands of lists alive
+// (~35k shadows, 200-280 MB of blocks in BOTW's overworld) and kills and re-records lists all the time. With malloc
+// the blocks, from 1 KB to megabytes, allocated on whichever thread records and freed in no particular order, left
+// the process growing by ~160 MB a minute in the per-thread malloc arenas while the live records stayed flat, until
+// the device swapped (Mali G610 handheld, 8 GB).
+// Sizes are powers of two from 1 KB. Up to 1 MB they are cut from 4 MB slabs, one size per slab, and a freed block
+// waits on its size's spare list; its pages go back to the kernel (MADV_DONTNEED) from 4 KB up, so what stays
+// resident is the live records plus the free blocks the shadow code keeps (FREE_BUDGET). Larger blocks are mapped
+// and unmapped one by one. Called with g_shadow_lock held.
+#define BLK_MIN_SHIFT 10
+#define BLK_SLAB_MAX_SHIFT 20
+#define BLK_SLAB (4ull << 20)
+typedef struct { void **v; int n, cap; uint8_t *slab; uint64_t slab_left; } BlkClass;
+static BlkClass g_blk[BLK_SLAB_MAX_SHIFT + 1];
+static uint64_t g_blk_mapped, g_blk_spare;  // bytes mapped in all; bytes on the spare lists
+
+static uint64_t blk_size(uint64_t want) {  // the size class a request gets
+    uint64_t s = 1ull << BLK_MIN_SHIFT;
+    while (s < want) s <<= 1;
+    return s;
+}
+static int blk_shift(uint64_t size) { int k = 0; while ((1ull << k) < size) k++; return k; }
+
+#ifndef _WIN32
+static void *blk_map(uint64_t size) {
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return NULL;
+    g_blk_mapped += size;
+    return p;
+}
+
+static void *blk_alloc(uint64_t size) {  // size: a blk_size class
+    int k = blk_shift(size);
+    if (k > BLK_SLAB_MAX_SHIFT) return blk_map(size);
+    BlkClass *c = &g_blk[k];
+    if (c->n) {
+        g_blk_spare -= size;
+        return c->v[--c->n];
+    }
+    if (c->slab_left < size) {
+        c->slab = blk_map(BLK_SLAB);
+        if (!c->slab) { c->slab_left = 0; return NULL; }
+        c->slab_left = BLK_SLAB;
+    }
+    void *p = c->slab;
+    c->slab += size;
+    c->slab_left -= size;
+    return p;
+}
+
+static void blk_free(void *p, uint64_t size) {
+    if (!p) return;
+    int k = blk_shift(size);
+    if (k > BLK_SLAB_MAX_SHIFT) {
+        munmap(p, size);
+        g_blk_mapped -= size;
+        return;
+    }
+    if (size >= 4096) madvise(p, size, MADV_DONTNEED);  // (slab blocks of 4 KB and up are page aligned)
+    BlkClass *c = &g_blk[k];
+    if (c->n == c->cap) {
+        int cap = c->cap ? c->cap * 2 : 64;
+        void **v = realloc(c->v, cap * sizeof *v);
+        if (!v) return;  // (the block is lost to reuse; its pages are already back with the kernel)
+        c->v = v;
+        c->cap = cap;
+    }
+    c->v[c->n++] = p;
+    g_blk_spare += size;
+}
+#else
+static void *blk_alloc(uint64_t size) { return malloc(size); }
+static void blk_free(void *p, uint64_t size) { (void)size; free(p); }
+#endif
+
 static void push_block(HBlock **v, int *n, int *cap, HBlock b) {
     if (*n == *cap) {
         *cap = *cap ? *cap * 2 : 256;
@@ -75,14 +153,18 @@ static HBlock block_get(uint64_t want) {  // (lock held) a free block that fits 
         uint64_t live = 0;
         for (int i = 0; i < g_nlive; i++)
             for (int j = 0; j < g_live[i]->nblocks; j++) live += g_live[i]->blocks[j].size;
-        LOG("[cmdbuf] frame %llu: %d lists' shadows, %llu MB of records; %d free blocks, %llu MB\n",
+        uint64_t grave = 0;
+        for (int i = 0; i < g_ngrave; i++) grave += g_grave[i].size;
+        LOG("[cmdbuf] frame %llu: %d lists' shadows, %llu MB of records; %d free blocks, %llu MB; %llu MB dying;"
+            " blocks mapped %llu MB (%llu MB spare, released)\n",
             (unsigned long long)now, g_nlive, (unsigned long long)(live >> 20), g_nfree,
-            (unsigned long long)(g_free_bytes >> 20));
+            (unsigned long long)(g_free_bytes >> 20), (unsigned long long)(grave >> 20),
+            (unsigned long long)(g_blk_mapped >> 20), (unsigned long long)(g_blk_spare >> 20));
         stats_at = now + 600;
     }
     int k = 0;
     for (; k < g_ngrave && now - g_grave[k].frame >= 3; k++) {
-        if (g_free_bytes + g_grave[k].size > FREE_BUDGET) { free(g_grave[k].mem); continue; }
+        if (g_free_bytes + g_grave[k].size > FREE_BUDGET) { blk_free(g_grave[k].mem, g_grave[k].size); continue; }
         g_free_bytes += g_grave[k].size;
         push_block(&g_free, &g_nfree, &g_capfree, g_grave[k]);
     }
@@ -94,8 +176,8 @@ static HBlock block_get(uint64_t want) {  // (lock held) a free block that fits 
             g_free_bytes -= b.size;
             return b;
         }
-    want = (want + 0xFF) & ~0xFFull;
-    HBlock b = {malloc(want), want, 0};
+    want = blk_size(want);
+    HBlock b = {blk_alloc(want), want, 0};
     if (!b.mem) FATAL("nvn: out of host memory for command records (%llu bytes)\n", (unsigned long long)want);
     return b;
 }
@@ -222,13 +304,16 @@ static HBlock shadow_block(Shadow *sh, int i, uint64_t want) {
 RT_ON_RESET(cmdbuf_shadow_reset) {  // (reboot: every list is dead; command buffers were guest objects)
     pthread_mutex_lock(&g_shadow_lock);
     for (int i = 0; i < g_nlive; i++) {
-        for (int k = 0; k < g_live[i]->nblocks; k++) free(g_live[i]->blocks[k].mem);
+        for (int k = 0; k < g_live[i]->nblocks; k++) blk_free(g_live[i]->blocks[k].mem, g_live[i]->blocks[k].size);
         free(g_live[i]->blocks);
         free(g_live[i]);
     }
     g_nlive = 0;
-    for (int i = 0; i < g_ngrave; i++) free(g_grave[i].mem);
+    for (int i = 0; i < g_ngrave; i++) blk_free(g_grave[i].mem, g_grave[i].size);
     g_ngrave = 0;
+    for (int i = 0; i < g_nfree; i++) blk_free(g_free[i].mem, g_free[i].size);
+    g_nfree = 0;
+    g_free_bytes = 0;
     pthread_mutex_unlock(&g_shadow_lock);
 }
 

@@ -360,8 +360,11 @@ static void use_guest_chunk(NvnCmdBuf *cb, uint64_t gmem, uint64_t gsize) {
     cb->gmem = gmem;
     cb->gsize = gsize;
     cb->gused = 0;
-    uint64_t want = gsize * 8;  // (records take several times the GPU bytes; more blocks chain on when needed, each
-    use_block(cb, 0, want < 0x400 ? 0x400 : want > 0x4000 ? 0x4000 : want);  // twice the last: start small)
+    // The first block is 1 KB whatever the chunk's size; more chain on when needed, each twice the last. Sized from
+    // the chunk (8x it, up to 16 KB), the blocks of the ~45k lists alive in BOTW's overworld came to 450 MB: the game
+    // adds windows of hundreds of KB and records a few hundred bytes in most (the comment at the top), so most of
+    // each block was never written.
+    use_block(cb, 0, 0x400);
 }
 
 NVN(nvnCommandBufferAddCommandMemory) {  // (cmd, pool, offset, size)

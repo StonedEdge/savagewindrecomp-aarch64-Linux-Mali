@@ -105,6 +105,7 @@ void vk_collect_dead(void);
 typedef struct {
     VkCommandBuffer main, upload;
     bool main_begun, upload_begun, ts;  // ts: GPU timestamps written (profiling)
+    bool old;                           // main / upload come from the retiring command pool (cb_recycle)
     uint64_t seq;
     VkDescriptorPool pools[64];  // (BOTW 1.8.2 records thousands of draws into one submission)
     int npools, cur_pool;
@@ -164,10 +165,65 @@ void vk_wait_seq(uint64_t seq) {
 
 uint64_t vk_pending_seq(void) { return submit_seq + 1; }
 
+// Command buffer recycling (SAVAGEWIND_VK_CB_RECYCLE=<submissions>, default 1024 on Mali, 0 off): every that many
+// submissions the slots move to a new command pool. Each slot frees its command buffers from the old pool when it is
+// next reused (its submission done), and the old pool is destroyed once the last one is freed. The Mali blob keeps a
+// list of the memory chunks it allocates for a command buffer's commands that is not emptied when the buffer is
+// reused and grows with a full copy each time (found in Tears of the Kingdom's port on the same driver: its memory
+// rose ~50 MB a minute and recording slowed down over 10-15 minutes); a new pool's buffers start empty.
+static int cb_recycle_every = -1;
+static uint32_t cb_submits_since;
+static VkCommandPool cb_old_pool;
+static int cb_old_left;  // slots still holding command buffers from cb_old_pool
+static unsigned cb_recycled;
+
+static void cb_recycle_submitted(void) {
+    if (cb_recycle_every < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_CB_RECYCLE");
+        cb_recycle_every = e && *e ? atoi(e) : g_vk.props.vendorID == 0x13B5 ? 1024 : 0;  // (0x13B5: Arm)
+        if (cb_recycle_every < 0) cb_recycle_every = 0;
+        if (cb_recycle_every)
+            LOG("[vk] submission command buffers move to a new pool every %d submissions (SAVAGEWIND_VK_CB_RECYCLE)\n",
+                cb_recycle_every);
+    }
+    if (!cb_recycle_every || cb_old_pool || ++cb_submits_since < (uint32_t)cb_recycle_every) return;
+    VkCommandPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                  .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
+    VkCommandPool np;
+    if (vkCreateCommandPool(g_vk.dev, &pi, NULL, &np) != VK_SUCCESS) return;  // (keep the current one)
+    cb_submits_since = 0;
+    cb_old_pool = g_vk.pool;
+    g_vk.pool = np;
+    cb_old_left = 0;
+    for (int i = 0; i < SUBS; i++)
+        if (subs[i].main || subs[i].upload) subs[i].old = true, cb_old_left++;
+    if (!cb_old_left) vkDestroyCommandPool(g_vk.dev, cb_old_pool, NULL), cb_old_pool = VK_NULL_HANDLE;
+}
+
+// A slot about to be reused (its submission done): command buffers from the retiring pool are freed, and new ones come
+// from the current pool when recorded (begin_cb)
+static void cb_recycle_slot(Sub *s) {
+    if (!s->old) return;
+    VkCommandBuffer cbs[2];
+    uint32_t n = 0;
+    if (s->main) cbs[n++] = s->main;
+    if (s->upload) cbs[n++] = s->upload;
+    if (n) vkFreeCommandBuffers(g_vk.dev, cb_old_pool, n, cbs);
+    s->main = s->upload = VK_NULL_HANDLE;
+    s->old = false;
+    if (--cb_old_left == 0) {
+        vkDestroyCommandPool(g_vk.dev, cb_old_pool, NULL);
+        cb_old_pool = VK_NULL_HANDLE;
+        unsigned n_done = ++cb_recycled;
+        if (!(n_done & (n_done - 1))) LOG("[vk] submission command pool recycled %u times\n", n_done);
+    }
+}
+
 static Sub *sub(void) {
     Sub *s = &subs[cur_sub];
     if (s->seq != submit_seq + 1) {  // slot reused: its previous submission must be done
         vk_wait_seq(s->seq);
+        cb_recycle_slot(s);
         if (s->ts) {  // (profiling) GPU time of that submission
             uint64_t t[2];
             if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -328,6 +384,7 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
     submit_seq++;
     pthread_mutex_unlock(&seq_lock);
     cur_sub = (cur_sub + 1) % SUBS;
+    cb_recycle_submitted();
     stat_flushes++;
     cum_submits++;
     chunk_draws = 0;
